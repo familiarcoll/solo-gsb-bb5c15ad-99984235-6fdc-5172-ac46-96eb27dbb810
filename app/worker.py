@@ -4,6 +4,11 @@ Each worker repeatedly claims one due task (atomically, via the DB layer),
 performs the HTTP delivery, and records the outcome. Failed deliveries are
 rescheduled with exponential backoff (1s, 2s, 4s) until the attempt budget
 is exhausted.
+
+Delivery is strictly ordered per subscription: the claim query only hands
+out a task once every earlier task of the same subscription has reached a
+terminal state (delivered/failed), so one subscription's webhooks arrive in
+creation order while different subscriptions are delivered in parallel.
 """
 from __future__ import annotations
 

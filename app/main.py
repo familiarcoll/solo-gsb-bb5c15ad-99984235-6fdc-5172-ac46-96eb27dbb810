@@ -224,6 +224,7 @@ def get_event_status(event_id: str) -> dict:
                 "last_status_code": t["last_status_code"],
                 "last_error": t["last_error"],
                 "result": t["result"],
+                "blocked": t["blocked"],
                 "history": history,
             }
         )

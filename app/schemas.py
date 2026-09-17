@@ -75,6 +75,9 @@ class TaskStatus(BaseModel):
     last_status_code: int | None
     last_error: str | None
     result: str | None
+    # True while an earlier task of the same subscription is unfinished;
+    # a blocked task stays pending and is not claimable yet.
+    blocked: bool = False
     history: list[AttemptOut]
 
 

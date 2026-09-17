@@ -8,8 +8,9 @@
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件投递**：一次提交可指定多个订阅，每个订阅生成独立任务
-- **持久化与断点续投**：任务存储在 SQLite 中，服务重启后自动恢复未完成任务（包括崩溃时处于 `in_progress` 状态的任务）
-- **并发安全**：多个工作器通过数据库级原子认领（SELECT + UPDATE 在同一临界区内）保证同一轮尝试不会被重复领取
+- **按订阅严格有序**：同一订阅的任务按创建顺序（`tasks.id` 升序）依次投递，较早任务未达终态（`delivered`/`failed`）时后续任务不会被认领；不同订阅之间互不阻塞、并行投递
+- **持久化与断点续投**：任务存储在 SQLite 中，服务重启后自动恢复未完成任务（包括崩溃时处于 `in_progress` 状态的任务），重启后有序约束保持有效
+- **并发安全**：多个工作器通过数据库级原子认领（SELECT + UPDATE 在同一临界区内）保证同一轮尝试不会被重复领取，且认领时实时校验同订阅前序任务已全部完成
 - **可靠重试**：非 2xx、连接错误、超时均视为失败，按 **1s → 2s → 4s** 退避重试，最多 **4 次**尝试后标记为失败
 - **幂等去重**：`(event_id, subscription_id)` 唯一约束，重复提交不会产生重复任务
 - **HMAC-SHA256 签名**：每个投递请求携带签名头，接收方可校验来源与完整性
@@ -157,6 +158,7 @@ curl -s http://localhost:8000/events/evt-001
       "last_status_code": 200,
       "last_error": null,
       "result": "delivered",
+      "blocked": false,
       "history": [
         {"attempt_no": 1, "status_code": 500, "error": "non-2xx response: 500", ...},
         {"attempt_no": 2, "status_code": 500, "error": "non-2xx response: 500", ...},
@@ -169,6 +171,7 @@ curl -s http://localhost:8000/events/evt-001
 
 `status` 取值：`pending`（等待执行）/ `in_progress`（投递中）/ `delivered`（成功）/ `failed`（最终失败）。
 `next_attempt_at` 仅在 `pending` 时有值，即下次执行时间。
+`blocked` 为 `true` 表示该 `pending` 任务正被同一订阅中更早的未完成任务阻塞（有序投递约束），在前序任务到达终态前不会被任何工作器认领；仅 `pending` 任务可能为 `true`。
 
 ### 其他端点
 
@@ -180,6 +183,14 @@ curl -s http://localhost:8000/events/evt-001
 | `GET` | `/subscriptions/{id}` | 查询单个订阅 |
 | `DELETE` | `/subscriptions/{id}` | 删除订阅（已有任务保留历史） |
 | `GET` | `/healthz` | 健康检查 |
+
+## 按订阅有序投递语义
+
+- **同一订阅严格 FIFO**：属于同一 `subscription_id` 的任务按 `tasks.id` 升序（即创建顺序）投递。只有前序任务全部到达终态（`delivered` 或 `failed`）后，下一条任务才会被工作器认领。
+- **队头阻塞**：较早任务处于 `pending`（含退避等待中）或 `in_progress` 时，后续任务保持 `pending` 且不会被任何工作器认领；状态查询中这些任务以 `blocked: true` 如实展示。
+- **订阅间并行**：有序约束仅作用于同一订阅内部，不同订阅的任务仍由多个工作器并行投递。
+- **重试不失序**：前序任务失败重试期间后续任务持续阻塞；前序任务重试成功（`delivered`）或重试耗尽（`failed`）后才放行下一条。
+- **重启后仍有效**：服务重启时将残留的 `in_progress` 任务重置为 `pending`；有序约束基于任务 ID 与状态在认领时实时判定，不依赖内存状态，因此崩溃恢复、失败重试后顺序语义保持不变。
 
 ## 接收端验签
 
@@ -207,8 +218,8 @@ def is_valid(secret: str, body: bytes, signature_header: str) -> bool:
 
 - **任务模型**：事件存于 `events` 表（payload 只存一份），每个 `(event_id, subscription_id)` 对应 `tasks` 表中一行（唯一约束保证幂等）；每次尝试写入 `attempts` 历史表。
 - **入站幂等**：每个验签通过的 `X-Webhook-Id` 在 `ingested_events` 表中记录一行（原始 body 字节 + 首次回执）。查重、冲突判定、建事件、建任务在同一个 SQLite 事务中完成；重放请求直接返回存储的首次回执，即使并发到达也只会有一个请求建任务。
-- **原子认领**：工作器在单个连接锁保护的临界区内完成「选中最旧到期任务 → 置为 `in_progress`」，并发工作器不会领到同一任务。
-- **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。
+- **原子认领与有序调度**：工作器在单个连接锁保护的临界区内完成「选中最旧到期且未被阻塞的任务 → 置为 `in_progress`」，并发工作器不会领到同一任务。认领查询带 `NOT EXISTS` 守卫：同一订阅中仍存在更早的 `pending`/`in_progress` 任务时，该任务不可被认领，从而在并发工作器下保证同一订阅严格按 `tasks.id` 升序投递（由 `idx_tasks_sub_order (subscription_id, status, id)` 索引支撑）。
+- **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。有序约束在重启后同样成立（见「按订阅有序投递语义」）。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。
 

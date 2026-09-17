@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS ingested_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_sub_order ON tasks (subscription_id, status, id);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
 """
 
@@ -242,10 +243,16 @@ class Database:
         return "created", receipt
 
     def claim_due_task(self, worker_id: str, now: float) -> dict | None:
-        """Atomically claim the oldest due task for this worker.
+        """Atomically claim the oldest due, unblocked task for this worker.
 
-        The SELECT-then-UPDATE runs under the connection lock, so two workers
-        can never claim the same task row.
+        Per-subscription FIFO: a task is claimable only when no earlier task
+        (smaller id) of the same subscription is still pending or in_progress,
+        so one subscription's deliveries happen strictly in task-id order
+        while different subscriptions are claimed in parallel. The guard is
+        evaluated inside the same locked SELECT-then-UPDATE critical section,
+        so the ordering constraint holds across concurrent workers, retries
+        (a task back to 'pending' keeps blocking its successors) and
+        restarts (requeued 'in_progress' rows become 'pending' again).
         """
         with self._lock:
             row = self._conn.execute(
@@ -254,6 +261,12 @@ class Database:
                    LEFT JOIN subscriptions s ON s.id = t.subscription_id
                    LEFT JOIN events e ON e.id = t.event_id
                    WHERE t.status = 'pending' AND t.next_attempt_at <= ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks prev
+                         WHERE prev.subscription_id = t.subscription_id
+                           AND prev.id < t.id
+                           AND prev.status IN ('pending', 'in_progress')
+                     )
                    ORDER BY t.next_attempt_at, t.id
                    LIMIT 1""",
                 (now,),
@@ -334,11 +347,35 @@ class Database:
                 (event_id,),
             ).fetchall()
 
+            # A pending task is blocked while an earlier task (smaller id) of
+            # the same subscription is still unfinished -- it cannot be
+            # claimed until that task reaches delivered/failed.
+            blocked_ids: set[int] = set()
+            for t in tasks:
+                if t["status"] != "pending":
+                    continue
+                blocker = self._conn.execute(
+                    """SELECT 1 FROM tasks prev
+                       WHERE prev.subscription_id = ?
+                         AND prev.id < ?
+                         AND prev.status IN ('pending', 'in_progress')
+                       LIMIT 1""",
+                    (t["subscription_id"], t["id"]),
+                ).fetchone()
+                if blocker is not None:
+                    blocked_ids.add(t["id"])
+
+        task_dicts = []
+        for t in tasks:
+            d = dict(t)
+            d["blocked"] = d["id"] in blocked_ids
+            task_dicts.append(d)
+
         history: dict[int, list[dict]] = {}
         for a in attempts:
             history.setdefault(a["task_id"], []).append(dict(a))
         return {
             "event": dict(event),
-            "tasks": [dict(t) for t in tasks],
+            "tasks": task_dicts,
             "attempts_by_task": history,
         }
