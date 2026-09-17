@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS ingested_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_sub_order ON tasks (subscription_id, id, status);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
 """
 
@@ -246,6 +247,16 @@ class Database:
 
         The SELECT-then-UPDATE runs under the connection lock, so two workers
         can never claim the same task row.
+
+        Strict per-subscription ordering: a task is eligible only when no
+        earlier task (smaller id) of the same subscription is still
+        'pending' or 'in_progress' -- the next task is released once its
+        predecessor reaches a terminal state ('delivered'/'failed'). The
+        rule is evaluated against persisted state at claim time, so it
+        holds across retry backoff, concurrent workers, and restarts.
+        Different subscriptions are independent and still claimed in
+        parallel; a blocked task simply stays 'pending' and remains
+        visible as such in status queries.
         """
         with self._lock:
             row = self._conn.execute(
@@ -254,6 +265,12 @@ class Database:
                    LEFT JOIN subscriptions s ON s.id = t.subscription_id
                    LEFT JOIN events e ON e.id = t.event_id
                    WHERE t.status = 'pending' AND t.next_attempt_at <= ?
+                     AND NOT EXISTS (
+                           SELECT 1 FROM tasks earlier
+                           WHERE earlier.subscription_id = t.subscription_id
+                             AND earlier.id < t.id
+                             AND earlier.status IN ('pending', 'in_progress')
+                         )
                    ORDER BY t.next_attempt_at, t.id
                    LIMIT 1""",
                 (now,),

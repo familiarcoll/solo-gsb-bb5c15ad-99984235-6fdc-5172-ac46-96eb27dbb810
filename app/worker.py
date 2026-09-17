@@ -4,6 +4,13 @@ Each worker repeatedly claims one due task (atomically, via the DB layer),
 performs the HTTP delivery, and records the outcome. Failed deliveries are
 rescheduled with exponential backoff (1s, 2s, 4s) until the attempt budget
 is exhausted.
+
+Claiming is strictly ordered per subscription: a task becomes claimable
+only after every earlier task (smaller id) of the same subscription has
+reached a terminal state (delivered/failed). The rule is enforced inside
+the atomic claim query, so it holds across retries, concurrent workers,
+and restarts, while different subscriptions are still delivered in
+parallel by multiple workers.
 """
 from __future__ import annotations
 
